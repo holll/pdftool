@@ -1,0 +1,9 @@
+# 构建产物
+pdftool.exe
+*.exe
+out/
+dist/
+
+# IDE
+.idea/
+.vscode/
