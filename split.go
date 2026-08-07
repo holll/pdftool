@@ -12,93 +12,97 @@ import (
 	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
 )
 
-// 按 span 拆分（每 span 页一个文件）
+// splitBySpan 按 span 拆分（每 span 页一个文件），输出到 outDir
 func splitBySpan(inFile, outDir string, span, angle int) error {
-	conf := model.NewDefaultConfiguration()
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		return fmt.Errorf("创建输出目录失败: %w", err)
+	}
 
+	conf := model.NewDefaultConfiguration()
 	if err := api.SplitFile(inFile, outDir, span, conf); err != nil {
 		return fmt.Errorf("split failed: %w", err)
 	}
 
-	if angle != 0 {
-		entries, _ := os.ReadDir(outDir)
-		for _, e := range entries {
-			if e.IsDir() {
-				continue
-			}
-			name := e.Name()
-			if strings.HasSuffix(strings.ToLower(name), ".pdf") {
-				path := filepath.Join(outDir, name)
-				if err := rotateFileInplace(path, angle); err != nil {
-					return err
-				}
-			}
-		}
-	}
-	return nil
+	return rotatePDFsInDir(outDir, angle)
 }
 
-// 按分割点拆分：pages 为类似 "3,6" 的分割点，生成多个区间文件：part_001.pdf ...
+// splitByPages 按分割点拆分：pages 为类似 "3,6" 的分割点，生成 [1-2],[3-5],[6-end] 等区间文件
 func splitByPages(inFile, outDir, pages string, angle int) error {
-	// 解析分割点
 	parts := parseIntsFromCSV(pages)
 	if len(parts) == 0 {
-		return fmt.Errorf("pages 参数为空")
+		return fmt.Errorf("pages 参数为空或包含非法值")
 	}
 	sort.Ints(parts)
 
-	// 获取原始页数（使用 api.PageCountFile）
 	conf := model.NewDefaultConfiguration()
 	total, err := api.PageCountFile(inFile)
 	if err != nil {
 		return fmt.Errorf("无法获取页数: %w", err)
 	}
 
-	// 生成区间 [1, p1-1], [p1, p2-1], ..., [last, total]
-	ranges := make([]string, 0)
-	prev := 1
+	// 过滤无效分割点：越界报错；分割点 1 或重复值无意义，跳过
+	valid := make([]int, 0, len(parts))
+	seen := make(map[int]bool, len(parts))
 	for _, p := range parts {
 		if p < 1 || p > total {
 			return fmt.Errorf("分割点 %d 超出页数范围 1-%d", p, total)
 		}
-		if p-1 >= prev {
-			ranges = append(ranges, fmt.Sprintf("%d-%d", prev, p-1))
+		if p == 1 || seen[p] {
+			continue
 		}
-		prev = p
+		seen[p] = true
+		valid = append(valid, p)
 	}
-	if prev <= total {
-		ranges = append(ranges, fmt.Sprintf("%d-%d", prev, total))
+	if len(valid) == 0 {
+		return fmt.Errorf("pages 中无有效分割点（分割点 1 或重复值无意义）")
 	}
 
-	// 导出每个区间
-	for i, r := range ranges {
-		outFile := filepath.Join(outDir, fmt.Sprintf("part_%03d.pdf", i+1))
-		if err := api.ExtractPagesFile(inFile, outFile, []string{r}, conf); err != nil {
-			return fmt.Errorf("导出区间 %s 失败: %w", r, err)
-		}
-		if angle != 0 {
-			if err := rotateFileInplace(outFile, angle); err != nil {
-				return err
-			}
-		}
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		return fmt.Errorf("创建输出目录失败: %w", err)
 	}
-	return nil
+	if err := api.SplitByPageNrFile(inFile, outDir, valid, conf); err != nil {
+		return fmt.Errorf("按分割点拆分失败: %w", err)
+	}
+	return rotatePDFsInDir(outDir, angle)
 }
 
-// 导出指定页（每页为单独文件），exportCSV 示例: "1,3,5" -> 导出 page_1.pdf, page_3.pdf ...
+// exportPages 导出指定页（每页为单独文件 page_N.pdf）
 func exportPages(inFile, outDir, exportCSV string, angle int) error {
 	pages := parseIntsFromCSV(exportCSV)
 	if len(pages) == 0 {
-		return fmt.Errorf("export 参数为空")
+		return fmt.Errorf("export 参数为空或包含非法值")
 	}
+
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		return fmt.Errorf("创建输出目录失败: %w", err)
+	}
+
 	conf := model.NewDefaultConfiguration()
 	for _, p := range pages {
-		f := filepath.Join(outDir, fmt.Sprintf("page_%d.pdf", p))
-		if err := api.ExtractPagesFile(inFile, f, []string{strconv.Itoa(p)}, conf); err != nil {
+		// ExtractPagesFile 的第二个参数是输出目录，且输出命名固定为 {文件名}_page_{n}.pdf，
+		// 因此先导出到临时子目录再重命名为 page_N.pdf
+		tmpDir := filepath.Join(outDir, fmt.Sprintf(".tmp_%d", p))
+		if err := os.MkdirAll(tmpDir, 0o755); err != nil {
+			return fmt.Errorf("创建临时目录失败: %w", err)
+		}
+		if err := api.ExtractPagesFile(inFile, tmpDir, []string{strconv.Itoa(p)}, conf); err != nil {
+			os.RemoveAll(tmpDir)
 			return fmt.Errorf("导出页 %d 失败: %w", p, err)
 		}
+		files, err := listPDFs(tmpDir)
+		if err != nil || len(files) != 1 {
+			os.RemoveAll(tmpDir)
+			return fmt.Errorf("导出页 %d 输出异常", p)
+		}
+		target := filepath.Join(outDir, fmt.Sprintf("page_%d.pdf", p))
+		if err := os.Rename(files[0], target); err != nil {
+			os.RemoveAll(tmpDir)
+			return err
+		}
+		os.RemoveAll(tmpDir)
+
 		if angle != 0 {
-			if err := rotateFileInplace(f, angle); err != nil {
+			if err := rotateFileInplace(target, angle); err != nil {
 				return err
 			}
 		}
@@ -106,7 +110,31 @@ func exportPages(inFile, outDir, exportCSV string, angle int) error {
 	return nil
 }
 
-// 解析 CSV 中的整数
+// rotatePDFsInDir 将目录下所有 PDF 按 angle 旋转（angle 为 0 则跳过）
+func rotatePDFsInDir(dir string, angle int) error {
+	if angle == 0 {
+		return nil
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return fmt.Errorf("读取输出目录失败: %w", err)
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if strings.HasSuffix(strings.ToLower(name), ".pdf") {
+			path := filepath.Join(dir, name)
+			if err := rotateFileInplace(path, angle); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// parseIntsFromCSV 解析 CSV 中的整数
 func parseIntsFromCSV(s string) []int {
 	s = strings.TrimSpace(s)
 	if s == "" {
