@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
@@ -28,16 +29,19 @@ func printHelp() {
 命令:
   split      拆分 PDF 文件
   merge      合并 PDF 文件
-  mcp        启动 MCP (Model Context Protocol) stdio 服务器
+  mcp        启动 MCP (Model Context Protocol) 服务器（stdio 或 HTTP）
   version    显示程序版本
 
 示例:
   pdftool split -in input.pdf -outdir out -span 1 -rotate 90
   pdftool merge -dir pdfs -out merged.pdf -rotate 180
+  pdftool mcp                                  # stdio 传输
+  pdftool mcp -transport http -addr 127.0.0.1:8765   # Streamable HTTP
 
 查看帮助:
   pdftool split -h
   pdftool merge -h
+  pdftool mcp -h
 `)
 }
 
@@ -63,7 +67,19 @@ func main() {
 	// MCP 服务器
 	// -------------------------
 	case "mcp":
-		runMCP()
+		fs := flag.NewFlagSet("mcp", flag.ExitOnError)
+
+		transport := fs.String("transport", "stdio", "传输方式：stdio 或 http")
+		addr := fs.String("addr", "127.0.0.1:8765", "HTTP 监听地址（transport=http 时生效）")
+		path := fs.String("path", "/mcp", "HTTP 端点路径")
+		token := fs.String("token", "", "HTTP Bearer 令牌（设置后请求必须带 Authorization: Bearer <token>）")
+		origins := fs.String("allow-origin", "", "额外允许的 Origin 来源，逗号分隔，可用 * 允许全部")
+
+		fs.Parse(os.Args[2:])
+
+		if err := runMCPServer(*transport, *addr, *path, *token, *origins); err != nil {
+			fail("MCP 服务异常：" + err.Error())
+		}
 		return
 
 	// -------------------------
@@ -111,15 +127,16 @@ func main() {
 			fail("错误：-span、-pages、-export 只能指定一个")
 		}
 
-		// 执行拆分
+		// 执行拆分（CLI 不做进度上报与取消）
+		ctx := context.Background()
 		var err error
 		switch {
 		case *export != "":
-			err = exportPages(*inFile, *outDir, *export, *rotate)
+			err = exportPages(ctx, *inFile, *outDir, *export, *rotate, nil)
 		case *span > 0:
-			err = splitBySpan(*inFile, *outDir, *span, *rotate)
+			err = splitBySpan(ctx, *inFile, *outDir, *span, *rotate, nil)
 		default:
-			err = splitByPages(*inFile, *outDir, *pages, *rotate)
+			err = splitByPages(ctx, *inFile, *outDir, *pages, *rotate, nil)
 		}
 
 		if err != nil {
@@ -165,7 +182,7 @@ func main() {
 		}
 
 		// 合并并旋转
-		err = mergeFiles(*outFile, inputFiles, *rotate)
+		err = mergeFiles(context.Background(), *outFile, inputFiles, *rotate, nil)
 		if err != nil {
 			fail("合并失败：" + err.Error())
 		}
