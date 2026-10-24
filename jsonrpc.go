@@ -71,27 +71,3 @@ func canonicalID(id json.RawMessage) string {
 	}
 	return buf.String()
 }
-
-// isInitialize 判断原始消息是否包含 initialize 请求（HTTP 建会话用）。
-func isInitialize(raw []byte) bool {
-	trimmed := bytes.TrimSpace(raw)
-	if len(trimmed) > 0 && trimmed[0] == '[' {
-		var batch []json.RawMessage
-		if err := json.Unmarshal(trimmed, &batch); err != nil {
-			return false
-		}
-		for _, item := range batch {
-			if isInitialize(item) {
-				return true
-			}
-		}
-		return false
-	}
-	var probe struct {
-		Method string `json:"method"`
-	}
-	if err := json.Unmarshal(trimmed, &probe); err != nil {
-		return false
-	}
-	return probe.Method == "initialize"
-}

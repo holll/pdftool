@@ -16,7 +16,7 @@ import (
 
 // MCP (Model Context Protocol) 服务端实现。
 //
-// 传输层见 mcp_stdio.go（newline-delimited JSON）与 mcp_http.go（Streamable HTTP）。
+// 传输层见 mcp_stdio.go（newline-delimited JSON over stdin/stdout）。
 // 本文件只负责与传输无关的协议逻辑：会话、方法分发、工具定义与参数校验。
 const (
 	mcpProtocolVersion = "2025-06-18"
@@ -47,22 +47,17 @@ func mcpServerInfo() map[string]any {
 	}
 }
 
-// session 表示一个 MCP 会话：stdio 全程一个，HTTP 每次 initialize 一个。
+// session 表示一个 MCP 会话（stdio 全程只有一个）。
 type session struct {
-	id string
-
 	mu       sync.Mutex
 	inflight map[string]context.CancelFunc
 
-	// notify 是服务端主动推送（进度等）的出口：stdio 直接写 stdout，
-	// HTTP 推到 SSE 通道；为 nil 时丢弃。
+	// notify 是服务端主动推送（进度等）的出口；为 nil 时丢弃。
 	notify func(msg []byte)
-
-	protocolVersion string
 }
 
-func newSession(id string) *session {
-	return &session{id: id, inflight: map[string]context.CancelFunc{}}
+func newSession() *session {
+	return &session{inflight: map[string]context.CancelFunc{}}
 }
 
 func (s *session) push(msg []byte) {
@@ -94,35 +89,11 @@ func (s *session) cancelRequest(id string) bool {
 	return ok
 }
 
-// mcpServer 持有会话表（HTTP 用；stdio 只有一个会话）。
-type mcpServer struct {
-	mu       sync.Mutex
-	sessions map[string]*session
-}
+// mcpServer 是协议处理核心（与传输无关，当前只由 stdio 驱动）。
+type mcpServer struct{}
 
 func newMCPServer() *mcpServer {
-	return &mcpServer{sessions: map[string]*session{}}
-}
-
-func (s *mcpServer) addSession(sess *session) {
-	s.mu.Lock()
-	s.sessions[sess.id] = sess
-	s.mu.Unlock()
-}
-
-func (s *mcpServer) session(id string) (*session, bool) {
-	s.mu.Lock()
-	sess, ok := s.sessions[id]
-	s.mu.Unlock()
-	return sess, ok
-}
-
-func (s *mcpServer) removeSession(id string) bool {
-	s.mu.Lock()
-	_, ok := s.sessions[id]
-	delete(s.sessions, id)
-	s.mu.Unlock()
-	return ok
+	return &mcpServer{}
 }
 
 func mustMarshal(v any) []byte {
@@ -226,7 +197,7 @@ func (s *mcpServer) handleNotification(ctx context.Context, sess *session, req *
 func (s *mcpServer) dispatch(ctx context.Context, sess *session, req *rpcRequest) *rpcResponse {
 	switch req.Method {
 	case "initialize":
-		return s.handleInitialize(sess, req)
+		return s.handleInitialize(req)
 
 	case "ping":
 		return &rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{}}
@@ -265,7 +236,7 @@ func (s *mcpServer) dispatch(ctx context.Context, sess *session, req *rpcRequest
 	}
 }
 
-func (s *mcpServer) handleInitialize(sess *session, req *rpcRequest) *rpcResponse {
+func (s *mcpServer) handleInitialize(req *rpcRequest) *rpcResponse {
 	var params struct {
 		ProtocolVersion string          `json:"protocolVersion"`
 		Capabilities    json.RawMessage `json:"capabilities"`
@@ -277,7 +248,6 @@ func (s *mcpServer) handleInitialize(sess *session, req *rpcRequest) *rpcRespons
 	if isSupportedProtocolVersion(params.ProtocolVersion) {
 		negotiated = params.ProtocolVersion
 	}
-	sess.protocolVersion = negotiated
 
 	return &rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{
 		"protocolVersion": negotiated,
